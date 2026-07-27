@@ -1,0 +1,5 @@
+# never commit real secrets
+.env
+
+# go build output (app is built inside Docker)
+/app/genproto/

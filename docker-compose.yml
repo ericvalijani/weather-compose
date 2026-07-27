@@ -1,0 +1,172 @@
+name: weather-compose
+
+networks:
+  weather:
+    driver: bridge
+
+volumes:
+  pgdata:
+  rabbitmq_data:
+  caddy_data:
+  caddy_config:
+  prometheus_data:
+  grafana_data:
+
+services:
+  # ---- Data layer ------------------------------------------------
+  postgres:
+    image: postgres:18.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [weather]
+
+  rabbitmq:
+    image: rabbitmq:4.3.2-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    ports:
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks: [weather]
+
+  redis:
+    image: redis:8.8.0-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [weather]
+
+  # ---- Application layer (one Go image, three MODEs) -------------
+  weather-store:
+    build:
+      context: ./app
+    image: ${IMAGE_REPO}:${IMAGE_TAG}
+    restart: unless-stopped
+    environment:
+      MODE: store
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    env_file: [.env]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9091/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks: [weather]
+
+  weather-api:
+    build:
+      context: ./app
+    image: ${IMAGE_REPO}:${IMAGE_TAG}
+    restart: unless-stopped
+    environment:
+      MODE: api
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    env_file: [.env]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      weather-store:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks: [weather]
+
+  weather-consumer:
+    build:
+      context: ./app
+    image: ${IMAGE_REPO}:${IMAGE_TAG}
+    restart: unless-stopped
+    environment:
+      MODE: consumer
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    env_file: [.env]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      weather-store:
+        condition: service_healthy
+    networks: [weather]
+
+  # ---- Edge + automation ----------------------------------------
+  caddy:
+    image: caddy:2.11.4-alpine
+    restart: unless-stopped
+    depends_on: [weather-api]
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [weather]
+
+  watchtower:
+    image: nickfedor/watchtower:1.19.0
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["--interval", "60", "--cleanup", "--label-enable"]
+    networks: [weather]
+
+  # ---- Monitoring -----------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.12.0
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks: [weather]
+
+  grafana:
+    image: grafana/grafana:13.1.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    networks: [weather]

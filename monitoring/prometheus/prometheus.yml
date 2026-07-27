@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: weather-api
+    static_configs:
+      - targets: ["weather-api:8080"]
+
+  - job_name: weather-store
+    static_configs:
+      - targets: ["weather-store:9091"]
