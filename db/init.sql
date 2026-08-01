@@ -12,3 +12,11 @@ CREATE TABLE IF NOT EXISTS weather_readings (
 
 CREATE INDEX IF NOT EXISTS idx_weather_city_time
     ON weather_readings (city, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS cities (
+    id         SERIAL PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    latitude   DOUBLE PRECISION NOT NULL,
+    longitude  DOUBLE PRECISION NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

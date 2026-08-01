@@ -4,10 +4,11 @@ This file is the spec that generated everything in this repo. Keep it at the
 project root — if you ever want to regenerate this from scratch (a newer
 model, a different tool, six months from now), this is what to hand it.
 
-It's been refined once already: the first pass produced a project with an
-archived dependency and a CI/Go version mismatch, both caught during a
-verification pass. The instructions below have those lessons folded in, so a
-fresh regeneration shouldn't repeat them.
+It's been refined more than once: an archived dependency, a CI/Go version
+mismatch, a Postgres major-version breaking change, and a renamed function
+whose call sites never got updated were all caught during verification
+passes. The instructions below have those lessons folded in, so a fresh
+regeneration shouldn't repeat any of them.
 
 ---
 
@@ -70,9 +71,10 @@ Services (10 total) — give me exact ports and named volumes, not just names:
   UI on :15672
 - redis (current stable, alpine variant) — cache of the latest reading per city
 - weather-store (Go, built locally) — gRPC server on :9090, health/metrics
-  HTTP on :9091, only service touching Postgres/Redis
+  plus /cities REST (GET/POST) on :9091, only service touching Postgres/Redis
 - weather-api (Go, built locally) — fetch loop + public HTTP on :8080
-  (/healthz, /metrics, /readings/latest)
+  (/healthz, /metrics, /readings/latest, /cities, and "/" serving the UI
+  described below)
 - weather-consumer (Go, built locally) — drains the queue, writes via store's
   gRPC, no exposed ports
 - caddy (current stable, alpine variant) — reverse proxy on :443/:80,
@@ -103,18 +105,39 @@ Contract & schema:
   latitude, longitude, temperature_c, windspeed_kph, observed_at, source) and
   a WeatherStore service with AddReading and GetLatest RPCs
 - Define the Postgres schema in db/init.sql: weather_readings table with an
-  index on (city, observed_at DESC)
+  index on (city, observed_at DESC), plus a cities table (name unique,
+  latitude, longitude) for the UI described below
 - protoc and the Go build happen inside a multi-stage Docker build — nothing
   but Docker + Docker Compose needed locally
 - Pin Go and all module dependencies to their current stable releases in
   go.mod (grpc, protobuf, a Postgres driver, go-redis, an amqp client,
   prometheus client) — check each one, don't assume
 
+Web UI for managing cities:
+- A dark-themed single page served at weather-api's "/" - a search box with
+  live autocomplete over the currently tracked cities
+- Typing a name that doesn't match anything tracked yet shows an inline
+  "+ Add" option instead of nothing
+- Adding a city: resolve the name to coordinates via Open-Meteo's free
+  geocoding API (no key required), persist it, then fetch and store its
+  temperature immediately - don't make the user wait for the next scheduled
+  FETCH_INTERVAL cycle just to see the city they just added
+- The city list must always be read from Postgres, never from the CITIES env
+  var after the very first boot. CITIES only ever seeds the table once, on
+  an empty database - after that, the database is the single source of
+  truth, including for whatever in-memory cache api keeps for its own fetch
+  loop. If a "quick refresh" cache is used, it must be refreshed by reading
+  the database again, not by hand-patching the cache's contents in code
+- Keep this on weather-store's existing small REST surface (the same :9091
+  that already serves /healthz and /metrics) rather than adding a new
+  service or exposing a new port - store is still the only thing that
+  touches Postgres directly
+
 Configuration:
 - Every tunable is an env var with a sane default: MODE, FETCH_INTERVAL,
   CITIES (Name:lat:lon, comma-separated, skip malformed entries), QUEUE,
-  API_PORT, STORE_ADDR, CACHE_TTL, REDIS_ADDR, Postgres connection vars,
-  RabbitMQ credentials, AMQP host/port
+  API_PORT, STORE_ADDR, STORE_HTTP_ADDR, CACHE_TTL, REDIS_ADDR, Postgres
+  connection vars, RabbitMQ credentials, AMQP host/port
 - .env with working defaults, .env.example as a template, .gitignore
   excluding .env
 
@@ -168,3 +191,14 @@ project as PROMPT.md, so the spec travels with the code.
 - **Asked for the prompt to be embedded in its own output.** A generated
   project is easiest to trust, audit, and regenerate later when the spec
   that made it ships alongside the code, not just in a chat log.
+- **Added a same-package consistency check as a required verification step,
+  not just a style check.** A function got renamed at its definition during
+  a later edit, but three call sites still used the old name — gofmt and a
+  raw-string/backtick check both passed cleanly, because neither one checks
+  whether an identifier actually exists. That's a different, cheaper check
+  than a full build (which needs network access to a module proxy this
+  project may not always have): parse the source and confirm every
+  same-package function call resolves to something actually defined.
+  Syntax-valid and semantically-consistent are two different guarantees;
+  this prompt now asks for both instead of assuming the first implies the
+  second.

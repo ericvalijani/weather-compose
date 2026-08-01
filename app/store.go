@@ -52,6 +52,7 @@ func runStore() {
 
 	rdb := redis.NewClient(&redis.Options{Addr: getenv("REDIS_ADDR", "redis:6379")})
 	srv := &storeServer{db: db, rdb: rdb, ttl: mustDuration("CACHE_TTL", "120s")}
+	seedCities(db, getenv("CITIES", ""))
 
 	// health + metrics endpoint used by the healthcheck and Prometheus
 	go func() {
@@ -61,6 +62,52 @@ func runStore() {
 			w.Write([]byte("ok"))
 		})
 		mux.Handle("/metrics", promhttp.Handler())
+
+		// /cities is store's own small REST surface (separate from the gRPC
+		// service above) - it's the only thing that touches the `cities`
+		// table, keeping the "only store touches Postgres" rule intact.
+		mux.HandleFunc("/cities", func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodGet:
+				rows, err := db.Query(`SELECT name, latitude, longitude FROM cities ORDER BY name`)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				defer rows.Close()
+				out := []cityCoord{}
+				for rows.Next() {
+					var c cityCoord
+					if err := rows.Scan(&c.Name, &c.Lat, &c.Lon); err == nil {
+						out = append(out, c)
+					}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(out)
+
+			case http.MethodPost:
+				var c cityCoord
+				if err := json.NewDecoder(r.Body).Decode(&c); err != nil || c.Name == "" {
+					http.Error(w, "invalid city payload", http.StatusBadRequest)
+					return
+				}
+				_, err := db.Exec(
+					`INSERT INTO cities (name, latitude, longitude) VALUES ($1,$2,$3)
+					 ON CONFLICT (name) DO UPDATE SET latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude`,
+					c.Name, c.Lat, c.Lon)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				log.Printf("store: city added/updated: %s (%.4f, %.4f)", c.Name, c.Lat, c.Lon)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(c)
+
+			default:
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			}
+		})
+
 		log.Println("store: health+metrics on :9091")
 		if err := http.ListenAndServe(":9091", mux); err != nil {
 			log.Printf("store: health server: %v", err)
@@ -121,4 +168,18 @@ func (s *storeServer) GetLatest(ctx context.Context, req *pb.GetLatestRequest) (
 	}
 	r.ObservedAt = observed.Format(time.RFC3339)
 	return &pb.GetLatestResponse{Reading: &r, Found: true}, nil
+}
+
+// seedCities inserts the initial CITIES list into the cities table once,
+// so the very first boot has something to show before anyone adds a city
+// through the UI. Safe to call every startup - ON CONFLICT DO NOTHING.
+func seedCities(db *sql.DB, csv string) {
+	for _, c := range parseCities(csv) {
+		_, err := db.Exec(
+			`INSERT INTO cities (name, latitude, longitude) VALUES ($1,$2,$3)
+			 ON CONFLICT (name) DO NOTHING`, c.Name, c.Lat, c.Lon)
+		if err != nil {
+			log.Printf("store: seed city %s: %v", c.Name, err)
+		}
+	}
 }

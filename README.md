@@ -30,20 +30,35 @@ labels, same command-line flags, drop-in replacement. If you've seen older
 tutorials referencing `containrrr/watchtower`, that image still exists on
 Docker Hub but won't receive further updates.
 
+## Web UI
+
+Open `https://localhost` (or `http://localhost:8080` if calling weather-api
+directly) for a small dark-themed page:
+
+- Search box with live autocomplete over your currently tracked cities
+- Type a city that isn't tracked yet and a "+ Add" option appears — it
+  resolves the name to coordinates via Open-Meteo's free geocoding API
+  (no key needed), saves it to Postgres, and fetches its temperature
+  immediately, no restart or waiting for the next scheduled fetch cycle
+- The city list is always read from Postgres (via `weather-store`'s own
+  `/cities` endpoint on :9091) — `CITIES` in `.env` only ever seeds the
+  table once, on the very first boot with an empty database
+
 ## Architecture
 
 ```
-            Open-Meteo (internet)
-                  |
-                  v
+            Open-Meteo (internet)          Open-Meteo geocoding (internet)
+                  |                                    ^
+                  v                                    | (on add-city)
   [weather-api] --publish--> [rabbitmq] --consume--> [weather-consumer]
    http :8080                  queue                        |
    /metrics                weather.readings                 | gRPC :9090
    /readings/latest                                         v
-        ^                                            [weather-store]
-        | gRPC GetLatest                             writes -> [postgres]
-        +--------------------------------------      cache  -> [redis]
-                                                     /metrics :9091
+   /cities (GET/POST)                                 [weather-store]
+   /  (UI page)                                        writes -> [postgres]
+        ^                                              cache  -> [redis]
+        | gRPC GetLatest/AddReading                    /cities (GET/POST, :9091)
+        +--------------------------------------        /metrics :9091
 
   [caddy] :80/:443 --reverse_proxy--> weather-api:8080
   [prometheus] :9090 scrapes weather-api + weather-store
@@ -75,18 +90,20 @@ make logs             # follow logs
 
 Endpoints:
 
-- App (via Caddy):   https://localhost            (accept the local cert)
-- Latest readings:   https://localhost/readings/latest
--                    https://localhost/readings/latest?city=Berlin
-- Grafana:           http://localhost:3000        (admin / devpassword)
-- Prometheus:        http://localhost:9090
-- RabbitMQ console:  http://localhost:15672       (admin / devpassword)
+- App UI (via Caddy):  https://localhost              (accept the local cert)
+- Latest readings:     https://localhost/readings/latest
+-                      https://localhost/readings/latest?city=Berlin
+- Cities (JSON):       https://localhost/cities        (GET list, POST to add)
+- Grafana:             http://localhost:3000           (admin / devpassword)
+- Prometheus:          http://localhost:9090
+- RabbitMQ console:    http://localhost:15672          (admin / devpassword)
 
 Inspect data:
 
 ```bash
 make psql
 #  SELECT city, temperature_c, observed_at FROM weather_readings ORDER BY observed_at DESC LIMIT 10;
+#  SELECT name, latitude, longitude FROM cities ORDER BY name;
 make redis-cli
 #  GET latest:Tehran
 ```
@@ -95,11 +112,32 @@ make redis-cli
 
 Yes, end to end:
 
-- store  -> Postgres (writes) + Redis (cache) + gRPC server + /metrics
-- api    -> Open-Meteo (fetch) + RabbitMQ (publish) + gRPC client (reads) + /metrics
+- store  -> Postgres (writes) + Redis (cache) + gRPC server + REST /cities + /metrics
+- api    -> Open-Meteo (fetch + geocoding) + RabbitMQ (publish) + gRPC client (reads) + /metrics + UI
 - consumer -> RabbitMQ (consume) + gRPC (AddReading -> store -> Postgres)
 
-`FETCH_INTERVAL` is 300s by default; lower it in .env to see data sooner.
+`FETCH_INTERVAL` is 300s by default; lower it in .env to see data sooner for
+your originally configured cities. Cities added through the UI get their
+first reading immediately, without waiting for the next cycle.
+
+**If you're adding the `cities` table to an already-running stack** (rather
+than starting fresh): Postgres only runs `db/init.sql` once, on a genuinely
+empty data volume. If your `pgdata` volume predates this feature, adding a
+city will fail with `relation "cities" does not exist` until you either run
+`docker compose down -v` (wipes data, re-seeds from CITIES) or create the
+table manually once:
+
+```bash
+docker compose exec postgres psql -U weather -d weatherdb -c "
+CREATE TABLE IF NOT EXISTS cities (
+    id         SERIAL PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    latitude   DOUBLE PRECISION NOT NULL,
+    longitude  DOUBLE PRECISION NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"
+```
 
 ## Monitoring
 
