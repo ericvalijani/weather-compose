@@ -67,8 +67,6 @@ services:
     restart: unless-stopped
     environment:
       MODE: store
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
     env_file: [.env]
     depends_on:
       postgres:
@@ -89,8 +87,6 @@ services:
     restart: unless-stopped
     environment:
       MODE: api
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
     env_file: [.env]
     depends_on:
       rabbitmq:
@@ -111,8 +107,6 @@ services:
     restart: unless-stopped
     environment:
       MODE: consumer
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
     env_file: [.env]
     depends_on:
       rabbitmq:
@@ -135,14 +129,6 @@ services:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
-    networks: [weather]
-
-  watchtower:
-    image: nickfedor/watchtower:1.19.0
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: ["--interval", "60", "--cleanup", "--label-enable"]
     networks: [weather]
 
   # ---- Monitoring -----------------------------------------------

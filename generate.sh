@@ -84,8 +84,6 @@ services:
     restart: unless-stopped
     environment:
       MODE: store
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
     env_file: [.env]
     depends_on:
       postgres:
@@ -106,8 +104,6 @@ services:
     restart: unless-stopped
     environment:
       MODE: api
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
     env_file: [.env]
     depends_on:
       rabbitmq:
@@ -128,8 +124,6 @@ services:
     restart: unless-stopped
     environment:
       MODE: consumer
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
     env_file: [.env]
     depends_on:
       rabbitmq:
@@ -152,14 +146,6 @@ services:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
-    networks: [weather]
-
-  watchtower:
-    image: nickfedor/watchtower:1.19.0
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: ["--interval", "60", "--cleanup", "--label-enable"]
     networks: [weather]
 
   # ---- Monitoring -----------------------------------------------
@@ -187,6 +173,7 @@ services:
       - "3000:3000"
     depends_on: [prometheus]
     networks: [weather]
+
 WEOF
 
 # ================================== .env ====================================
@@ -1630,7 +1617,7 @@ WEOF
 {
   printf '.PHONY: up down logs build restart ps psql redis-cli grafana prom\n\n'
   printf 'up:\n\tdocker compose up -d --build\n\n'
-  printf 'down:\n\tdocker compose down\n\n'
+  printf 'down:\n\tdocker compose down --remove-orphans\n\n'
   printf 'logs:\n\tdocker compose logs -f --tail=100\n\n'
   printf 'build:\n\tdocker compose build\n\n'
   printf 'restart:\n\tdocker compose restart\n\n'
@@ -1647,8 +1634,9 @@ cat > "$ROOT/README.md" <<'WEOF'
 
 A small but real multi-service weather app on Docker Compose. One Go image
 runs in three MODEs; Postgres stores data, RabbitMQ is the queue, Redis caches
-the latest reading per city, Caddy terminates HTTPS, Prometheus + Grafana
-provide monitoring, and Watchtower keeps the pulled images updated.
+the latest reading per city, Caddy terminates HTTPS, and Prometheus + Grafana
+provide monitoring. Deploys are manual and deliberate (see CI section below)
+— nothing polls a registry and auto-restarts things in the background.
 
 > The exact spec that generated this project lives in [`PROMPT.md`](PROMPT.md)
 > at the repo root — useful if you want to regenerate this later or adapt it.
@@ -1664,16 +1652,8 @@ provide monitoring, and Watchtower keeps the pulled images updated.
 | weather-api      | built locally (Go)             | 8080 HTTP                      |
 | weather-consumer | built locally (Go)             | none                            |
 | Caddy      | caddy:2.11.4-alpine                 | 80, 443                        |
-| Watchtower | nickfedor/watchtower:1.19.0          | none                            |
 | Prometheus | prom/prometheus:v3.12.0             | 9090                            |
 | Grafana    | grafana/grafana:13.1.0              | 3000                            |
-
-**Note on Watchtower:** the original `containrrr/watchtower` project was
-archived in December 2025 and is no longer maintained. This project uses
-`nickfedor/watchtower`, the actively developed, API-compatible fork — same
-labels, same command-line flags, drop-in replacement. If you've seen older
-tutorials referencing `containrrr/watchtower`, that image still exists on
-Docker Hub but won't receive further updates.
 
 ## Web UI
 
@@ -1708,7 +1688,6 @@ directly) for a small dark-themed page:
   [caddy] :80/:443 --reverse_proxy--> weather-api:8080
   [prometheus] :9090 scrapes weather-api + weather-store
   [grafana]    :3000 dashboards (Prometheus datasource)
-  [watchtower] auto-updates pulled images
 ```
 
 ## Generate + run
@@ -1803,48 +1782,56 @@ Prometheus scrapes them; Grafana auto-loads the "Weather Overview" dashboard.
 | ConfigMap/Secret  | .env / environment                       |
 | PVC/StatefulSet   | named volume pgdata                      |
 | probes            | healthcheck blocks                      |
-| Helm/ArgoCD       | this docker-compose.yml + Watchtower    |
+| Helm/ArgoCD       | this docker-compose.yml                  |
 | cert-manager      | Caddy automatic HTTPS                    |
 | kube-prometheus   | prometheus + grafana services           |
 
-## CI/CD: develop -> push -> auto-deploy
-
-The loop you asked for (no ArgoCD, no Kubernetes):
+## CI: develop -> push -> build (deploy is manual, on purpose)
 
 1. Edit the Go code in `app/` and push to GitHub (`main` branch).
 2. GitHub Actions (`.github/workflows/ci.yml`) runs `go vet` + `go test`, then
    builds the Docker image and pushes it to GitHub Container Registry (GHCR) as
    `ghcr.io/<owner>/<repo>:latest` (also tagged with the commit SHA).
-3. Watchtower on your laptop polls GHCR every 60s, detects the new `:latest`,
-   pulls it, and restarts the `weather-*` services automatically.
+3. Nothing auto-deploys it. Two different ways to actually run the new code
+   — pick one, don't mix them:
 
-### One-time setup
+   **Build locally from source** (what you've likely been doing — ignores
+   GHCR entirely, just rebuilds from your own `app/` directory):
+   ```bash
+   git pull
+   docker compose up -d --build weather-api weather-store weather-consumer
+   ```
+
+   **Or use the image GitHub Actions already built**, without a local Docker
+   build at all:
+   ```bash
+   docker compose pull weather-api weather-store weather-consumer
+   docker compose up -d weather-api weather-store weather-consumer
+   ```
+   (no `--build` here — adding it would immediately overwrite the pulled
+   image with a fresh local build, since these services have both `build:`
+   and `image:` set, and `--build` always wins)
+
+There used to be a Watchtower service here doing step 3 automatically. It was
+removed: it recreates containers outside `docker compose`'s own bookkeeping,
+and if that recreation gets interrupted (e.g. a VPN dropping mid-pull), a
+container can end up removed but never recreated — orphaned from Compose's
+view of the project, causing "name already in use" errors on the next
+`docker compose up` that even `docker compose down` can't clean up (you'd
+need `docker compose down --remove-orphans`, or a manual `docker rm`).
+Deploying by hand means you always know exactly when and why something
+restarted.
+
+### One-time setup (still needed for the build/push half)
 
 - Push the CONTENTS of `weather-compose/` as your repo root, so that `app/` and
   `.github/` sit at the top of the repo.
 - In `.env`, set `IMAGE_REPO` to your repo, ALL lowercase:
   `IMAGE_REPO=ghcr.io/<owner>/<repo>`
-- The first push triggers the build. Then make the GHCR package public:
-  GitHub -> your avatar -> Packages -> select the package -> Package settings
-  -> Change visibility -> Public. (Public means Watchtower needs no login.)
-- Start the stack locally once with `make up`. From then on, every push that
-  turns green auto-updates the running app.
-
-### Private package instead of public?
-
-If you keep the GHCR package private, Watchtower needs credentials. Create a
-GitHub Personal Access Token with `read:packages`, run `docker login ghcr.io`
-on the laptop, then add this to the `watchtower` service in `docker-compose.yml`:
-
-```
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${HOME}/.docker/config.json:/config.json:ro
-```
-
-Watchtower only touches services labelled
-`com.centurylinklabs.watchtower.enable=true` (the three `weather-*` services),
-so Postgres, Grafana, etc. are never restarted by it.
+- The first push triggers the build. Make the GHCR package public if you want
+  `docker compose pull` to work without a login: GitHub -> your avatar ->
+  Packages -> select the package -> Package settings -> Change visibility ->
+  Public. (Private is fine too — just `docker login ghcr.io` first.)
 
 ## Not for production as-is
 
@@ -1852,6 +1839,7 @@ so Postgres, Grafana, etc. are never restarted by it.
   secrets / a secrets manager and drop .env from git for real use.
 - Go is compiled inside the Docker build (protoc generates the gRPC stubs
   there), so you only need Docker + Docker Compose on your machine.
+
 
 WEOF
 
@@ -1923,7 +1911,7 @@ Version policy — read this before picking any image or dependency:
   language version as go.mod. A CI runner on an older toolchain than the
   module requires will fail on the very first run.
 
-Services (10 total) — give me exact ports and named volumes, not just names:
+Services (9 total) — give me exact ports and named volumes, not just names:
 - postgres (current stable, alpine variant) — durable storage, named volume
   for data (pgdata)
 - rabbitmq (current stable, management variant) — message queue, management
@@ -1938,9 +1926,6 @@ Services (10 total) — give me exact ports and named volumes, not just names:
   gRPC, no exposed ports
 - caddy (current stable, alpine variant) — reverse proxy on :443/:80,
   automatic HTTPS
-- an image that auto-redeploys updated containers by polling a registry
-  (verify whether the well-known option for this is still maintained before
-  picking it)
 - prom/prometheus (current stable) — scrapes app metrics, UI on :9090
 - grafana/grafana (current stable) — dashboards, auto-provisioned on first
   boot, UI on :3000
@@ -2012,8 +1997,11 @@ Deploy/ops:
   condition: service_healthy
 - GitHub Actions: go vet + go test, build and push to GHCR (commit SHA tag,
   plus latest as a convenience alias only)
-- The auto-redeploy service polls GHCR periodically and restarts only the
-  three weather-* services via a docker label
+- No auto-deploy service watching the registry in the background - deploy is
+  a deliberate, manual `docker compose up -d --build` when I actually want
+  the new image. Don't add anything that recreates containers on its own;
+  I need to know exactly when and why something restarts, not have it
+  happen silently in the background
 - Explain which credentials I actually type at any point vs. what's automatic
 
 Be upfront about rough edges — auto-ack in the consumer, plaintext gRPC inside
@@ -2061,6 +2049,16 @@ project as PROMPT.md, so the spec travels with the code.
   Syntax-valid and semantically-consistent are two different guarantees;
   this prompt now asks for both instead of assuming the first implies the
   second.
+- **Dropped the auto-redeploy service entirely, after using it for a
+  while.** It recreates containers outside `docker compose`'s own
+  bookkeeping — when that happens mid-update (e.g. a VPN connection
+  dropping partway through a pull, relevant on a sanctioned network), the
+  container can end up removed but never recreated, orphaned from
+  Compose's view of the project, causing confusing "name already in use"
+  errors on the next `docker compose up` that a plain `down` can't clean up
+  either. Not worth the tradeoff for someone who was rebuilding manually
+  with `--build` anyway and wants to know exactly when something restarts,
+  not have it happen silently in the background.
 
 PEOF
 

@@ -64,7 +64,7 @@ Version policy — read this before picking any image or dependency:
   language version as go.mod. A CI runner on an older toolchain than the
   module requires will fail on the very first run.
 
-Services (10 total) — give me exact ports and named volumes, not just names:
+Services (9 total) — give me exact ports and named volumes, not just names:
 - postgres (current stable, alpine variant) — durable storage, named volume
   for data (pgdata)
 - rabbitmq (current stable, management variant) — message queue, management
@@ -79,9 +79,6 @@ Services (10 total) — give me exact ports and named volumes, not just names:
   gRPC, no exposed ports
 - caddy (current stable, alpine variant) — reverse proxy on :443/:80,
   automatic HTTPS
-- an image that auto-redeploys updated containers by polling a registry
-  (verify whether the well-known option for this is still maintained before
-  picking it)
 - prom/prometheus (current stable) — scrapes app metrics, UI on :9090
 - grafana/grafana (current stable) — dashboards, auto-provisioned on first
   boot, UI on :3000
@@ -153,8 +150,11 @@ Deploy/ops:
   condition: service_healthy
 - GitHub Actions: go vet + go test, build and push to GHCR (commit SHA tag,
   plus latest as a convenience alias only)
-- The auto-redeploy service polls GHCR periodically and restarts only the
-  three weather-* services via a docker label
+- No auto-deploy service watching the registry in the background - deploy is
+  a deliberate, manual `docker compose up -d --build` when I actually want
+  the new image. Don't add anything that recreates containers on its own;
+  I need to know exactly when and why something restarts, not have it
+  happen silently in the background
 - Explain which credentials I actually type at any point vs. what's automatic
 
 Be upfront about rough edges — auto-ack in the consumer, plaintext gRPC inside
@@ -202,3 +202,14 @@ project as PROMPT.md, so the spec travels with the code.
   Syntax-valid and semantically-consistent are two different guarantees;
   this prompt now asks for both instead of assuming the first implies the
   second.
+- **Dropped the auto-redeploy service entirely, after using it for a
+  while.** It recreates containers outside `docker compose`'s own
+  bookkeeping — when that happens mid-update (e.g. a VPN connection
+  dropping partway through a pull, relevant on a sanctioned network), the
+  container can end up removed but never recreated, orphaned from
+  Compose's view of the project, causing confusing "name already in use"
+  errors on the next `docker compose up` that a plain `down` can't clean up
+  either. Not worth the tradeoff for someone who was rebuilding manually
+  with `--build` anyway and wants to know exactly when something restarts,
+  not have it happen silently in the background.
+
