@@ -2039,6 +2039,148 @@ func TestParseCitiesSkipsMalformed(t *testing.T) {
 }
 WEOF
 
+cat > "$ROOT/app/city_cache_test.go" <<'WEOF'
+package main
+
+import (
+	"fmt"
+	"sync"
+	"testing"
+)
+
+func TestGetSetCities(t *testing.T) {
+	setCities(nil) // start from a known, empty state
+	if got := getCities(); len(got) != 0 {
+		t.Fatalf("expected empty cache, got %d cities", len(got))
+	}
+
+	want := []cityCoord{
+		{Name: "Tehran", Lat: 35.6892, Lon: 51.3890},
+		{Name: "Paris", Lat: 48.8566, Lon: 2.3522},
+	}
+	setCities(want)
+
+	got := getCities()
+	if len(got) != len(want) {
+		t.Fatalf("expected %d cities, got %d", len(want), len(got))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("city %d: expected %+v, got %+v", i, want[i], got[i])
+		}
+	}
+}
+
+// TestGetCitiesReturnsACopy is the whole reason getCities copies the
+// slice before returning it: a caller mutating what it got back must
+// never be able to corrupt the cache's own backing array.
+func TestGetCitiesReturnsACopy(t *testing.T) {
+	setCities([]cityCoord{{Name: "Tehran", Lat: 35.6892, Lon: 51.3890}})
+
+	got := getCities()
+	got[0].Name = "Corrupted"
+
+	again := getCities()
+	if again[0].Name != "Tehran" {
+		t.Fatalf("cache was corrupted through a returned slice: got %q", again[0].Name)
+	}
+}
+
+// TestConcurrentCityCacheAccess exercises the cache the way this app
+// actually uses it: one path periodically replacing the whole list
+// (refreshCityListPeriodically), many others reading it at the same time
+// (every HTTP request). Run with `go test -race` to actually catch a
+// broken mutex - without -race this test can pass even if the locking
+// were wrong.
+func TestConcurrentCityCacheAccess(t *testing.T) {
+	var wg sync.WaitGroup
+
+	for w := 0; w < 5; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				setCities([]cityCoord{
+					{Name: fmt.Sprintf("writer-%d-city-%d", id, i), Lat: 1, Lon: 2},
+				})
+			}
+		}(w)
+	}
+
+	for r := 0; r < 5; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				_ = getCities()
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+WEOF
+
+cat > "$ROOT/app/http_handlers_test.go" <<'WEOF'
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestDecodeCityName(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		want    string
+		wantErr bool
+	}{
+		{name: "valid name", body: `{"name":"Paris"}`, want: "Paris"},
+		{name: "trims whitespace", body: `{"name":"  Tokyo  "}`, want: "Tokyo"},
+		{name: "empty name", body: `{"name":""}`, wantErr: true},
+		{name: "whitespace-only name", body: `{"name":"   "}`, wantErr: true},
+		{name: "missing name field", body: `{}`, wantErr: true},
+		{name: "malformed JSON", body: `{not json`, wantErr: true},
+		{name: "empty body", body: ``, wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/cities", strings.NewReader(tc.body))
+			got, err := decodeCityName(req)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error, got name %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("expected %q, got %q", tc.want, got)
+			}
+		})
+	}
+}
+
+// TestErrProvideCityNameMessage pins the exact error text, since
+// decodeCityName's error doubles as what http.Error sends straight to the
+// client (see handleCitiesPost) - a future edit changing this message
+// without meaning to would otherwise go unnoticed.
+func TestErrProvideCityNameMessage(t *testing.T) {
+	if errProvideCityName.Error() != "provide a city name" {
+		t.Fatalf("unexpected error message: %q", errProvideCityName.Error())
+	}
+}
+
+WEOF
+
 # ================================ Makefile ==================================
 # built with printf so the recipe lines get real TAB characters
 {
@@ -2212,6 +2354,33 @@ Prometheus scrapes them; Grafana auto-loads the "Weather Overview" dashboard.
 | Helm/ArgoCD       | this docker-compose.yml                  |
 | cert-manager      | Caddy automatic HTTPS                    |
 | kube-prometheus   | prometheus + grafana services           |
+
+## Running tests locally
+
+`go test` isn't installed on your machine and can't just be run directly
+against `app/` - the Go source imports a package (`weather/genproto`) that
+doesn't exist as real files until `protoc` generates it from
+`proto/weather.proto`, which normally only happens invisibly inside the
+Docker build. To run the tests, replicate that one step first in a
+throwaway container:
+
+```bash
+docker run --rm -v "$(pwd)/app:/src" -w /src golang:1.26-alpine sh -c "
+  apk add --no-cache protobuf protobuf-dev git &&
+  go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11 &&
+  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2 &&
+  export PATH=\$PATH:\$(go env GOPATH)/bin &&
+  protoc --go_out=. --go_opt=module=weather --go-grpc_out=. --go-grpc_opt=module=weather proto/weather.proto &&
+  go mod tidy &&
+  go test ./... -v
+"
+```
+
+Add `-race` to the last line to also catch concurrency bugs (relevant to
+`TestConcurrentCityCacheAccess` in `city_cache_test.go`).
+
+You don't have to run this yourself, though - the same `go vet` + `go test`
+already runs automatically on every push, in the CI job below.
 
 ## CI: develop -> push -> build (deploy is manual, on purpose)
 

@@ -154,6 +154,33 @@ Prometheus scrapes them; Grafana auto-loads the "Weather Overview" dashboard.
 | cert-manager      | Caddy automatic HTTPS                    |
 | kube-prometheus   | prometheus + grafana services           |
 
+## Running tests locally
+
+`go test` isn't installed on your machine and can't just be run directly
+against `app/` - the Go source imports a package (`weather/genproto`) that
+doesn't exist as real files until `protoc` generates it from
+`proto/weather.proto`, which normally only happens invisibly inside the
+Docker build. To run the tests, replicate that one step first in a
+throwaway container:
+
+```bash
+docker run --rm -v "$(pwd)/app:/src" -w /src golang:1.26-alpine sh -c "
+  apk add --no-cache protobuf protobuf-dev git &&
+  go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11 &&
+  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2 &&
+  export PATH=\$PATH:\$(go env GOPATH)/bin &&
+  protoc --go_out=. --go_opt=module=weather --go-grpc_out=. --go-grpc_opt=module=weather proto/weather.proto &&
+  go mod tidy &&
+  go test ./... -v
+"
+```
+
+Add `-race` to the last line to also catch concurrency bugs (relevant to
+`TestConcurrentCityCacheAccess` in `city_cache_test.go`).
+
+You don't have to run this yourself, though - the same `go vet` + `go test`
+already runs automatically on every push, in the CI job below.
+
 ## CI: develop -> push -> build (deploy is manual, on purpose)
 
 1. Edit the Go code in `app/` and push to GitHub (`main` branch).
