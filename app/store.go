@@ -6,17 +6,20 @@ import (
 	"encoding/json"
 	"log"
 	"net"
-	"net/http"
 	"time"
 
 	pb "weather/genproto"
 
 	_ "github.com/lib/pq"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 )
 
+// storeServer implements the WeatherStore gRPC service (AddReading,
+// GetLatest below). This is the only thing in the whole project that
+// talks to Postgres and Redis directly for weather readings - api and
+// consumer only ever reach that data through this gRPC interface. (The
+// `cities` table is a separate, simpler case - see store_http.go.)
 type storeServer struct {
 	pb.UnimplementedWeatherStoreServer
 	db  *sql.DB
@@ -24,7 +27,29 @@ type storeServer struct {
 	ttl time.Duration
 }
 
+// runStore is the entire life of the `store` mode: connect to Postgres,
+// connect to Redis, seed the cities table on first boot, then start both
+// servers - the REST one (store_http.go) in the background, the gRPC one
+// in the foreground.
 func runStore() {
+	db := mustConnectPostgres()
+
+	rdb := redis.NewClient(&redis.Options{Addr: getenv("REDIS_ADDR", "redis:6379")})
+	srv := &storeServer{db: db, rdb: rdb, ttl: mustDuration("CACHE_TTL", "120s")}
+	seedCities(db, getenv("CITIES", ""))
+
+	go serveStoreHTTP(db)
+
+	serveGRPC(srv)
+}
+
+// mustConnectPostgres retries the connection up to 30 times, 2 seconds
+// apart, before giving up. This matters because Docker Compose starts
+// containers in parallel by default - by the time this process starts,
+// the postgres container may exist but Postgres itself might not have
+// finished initializing yet. "must" because there's nothing useful this
+// service can do without a database.
+func mustConnectPostgres() *sql.DB {
 	dsn := "host=" + getenv("PGHOST", "postgres") +
 		" port=" + getenv("PGPORT", "5432") +
 		" user=" + getenv("POSTGRES_USER", "weather") +
@@ -32,88 +57,30 @@ func runStore() {
 		" dbname=" + getenv("POSTGRES_DB", "weatherdb") +
 		" sslmode=disable"
 
+	const attempts = 30
+	const delay = 2 * time.Second
+
 	var db *sql.DB
 	var err error
-	for i := 0; i < 30; i++ {
+	for i := 0; i < attempts; i++ {
 		db, err = sql.Open("postgres", dsn)
 		if err == nil {
 			err = db.Ping()
 		}
 		if err == nil {
-			break
+			log.Println("store: connected to postgres")
+			return db
 		}
 		log.Printf("store: waiting for postgres: %v", err)
-		time.Sleep(2 * time.Second)
+		time.Sleep(delay)
 	}
-	if err != nil {
-		log.Fatalf("store: cannot connect to postgres: %v", err)
-	}
-	log.Println("store: connected to postgres")
+	log.Fatalf("store: cannot connect to postgres: %v", err)
+	return nil // unreachable - log.Fatalf exits the process
+}
 
-	rdb := redis.NewClient(&redis.Options{Addr: getenv("REDIS_ADDR", "redis:6379")})
-	srv := &storeServer{db: db, rdb: rdb, ttl: mustDuration("CACHE_TTL", "120s")}
-	seedCities(db, getenv("CITIES", ""))
-
-	// health + metrics endpoint used by the healthcheck and Prometheus
-	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("ok"))
-		})
-		mux.Handle("/metrics", promhttp.Handler())
-
-		// /cities is store's own small REST surface (separate from the gRPC
-		// service above) - it's the only thing that touches the `cities`
-		// table, keeping the "only store touches Postgres" rule intact.
-		mux.HandleFunc("/cities", func(w http.ResponseWriter, r *http.Request) {
-			switch r.Method {
-			case http.MethodGet:
-				rows, err := db.Query(`SELECT name, latitude, longitude FROM cities ORDER BY name`)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-				defer rows.Close()
-				out := []cityCoord{}
-				for rows.Next() {
-					var c cityCoord
-					if err := rows.Scan(&c.Name, &c.Lat, &c.Lon); err == nil {
-						out = append(out, c)
-					}
-				}
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(out)
-
-			case http.MethodPost:
-				var c cityCoord
-				if err := json.NewDecoder(r.Body).Decode(&c); err != nil || c.Name == "" {
-					http.Error(w, "invalid city payload", http.StatusBadRequest)
-					return
-				}
-				_, err := db.Exec(
-					`INSERT INTO cities (name, latitude, longitude) VALUES ($1,$2,$3)
-					 ON CONFLICT (name) DO UPDATE SET latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude`,
-					c.Name, c.Lat, c.Lon)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-				log.Printf("store: city added/updated: %s (%.4f, %.4f)", c.Name, c.Lat, c.Lon)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(c)
-
-			default:
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			}
-		})
-
-		log.Println("store: health+metrics on :9091")
-		if err := http.ListenAndServe(":9091", mux); err != nil {
-			log.Printf("store: health server: %v", err)
-		}
-	}()
-
+// serveGRPC starts the WeatherStore gRPC server and blocks forever (or
+// until it fails). Meant to be the last thing runStore calls.
+func serveGRPC(srv *storeServer) {
 	lis, err := net.Listen("tcp", ":9090")
 	if err != nil {
 		log.Fatalf("store: listen: %v", err)
@@ -126,7 +93,11 @@ func runStore() {
 	}
 }
 
-// AddReading inserts a reading, refreshes the Redis cache, bumps metrics.
+// AddReading is the write path: insert into Postgres (the permanent
+// record), then best-effort refresh the Redis cache. If the cache write
+// fails, that's not treated as an error - GetLatest below will just fall
+// back to Postgres on its next call, so a Redis hiccup here never loses
+// the actual reading.
 func (s *storeServer) AddReading(ctx context.Context, r *pb.Reading) (*pb.AddReadingResponse, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx,
@@ -138,15 +109,21 @@ func (s *storeServer) AddReading(ctx context.Context, r *pb.Reading) (*pb.AddRea
 	if err != nil {
 		return nil, err
 	}
+
 	if b, e := json.Marshal(r); e == nil {
 		s.rdb.Set(ctx, "latest:"+r.City, b, s.ttl)
 	}
+
 	storedTotal.Inc()
 	log.Printf("store: saved id=%d city=%s temp=%.1f", id, r.City, r.TemperatureC)
 	return &pb.AddReadingResponse{Id: id}, nil
 }
 
-// GetLatest returns the newest reading for a city (cache first, then Postgres).
+// GetLatest is the read path: Redis first (the fast, common case), and
+// only fall back to Postgres on a cache miss. A miss happens either
+// because CACHE_TTL expired naturally, or because Redis was restarted and
+// lost its data - Postgres being the permanent record means neither case
+// ever actually loses a reading, just costs one extra query.
 func (s *storeServer) GetLatest(ctx context.Context, req *pb.GetLatestRequest) (*pb.GetLatestResponse, error) {
 	if v, err := s.rdb.Get(ctx, "latest:"+req.City).Result(); err == nil {
 		var r pb.Reading
@@ -154,6 +131,7 @@ func (s *storeServer) GetLatest(ctx context.Context, req *pb.GetLatestRequest) (
 			return &pb.GetLatestResponse{Reading: &r, Found: true}, nil
 		}
 	}
+
 	var r pb.Reading
 	var observed time.Time
 	err := s.db.QueryRowContext(ctx,
@@ -166,13 +144,16 @@ func (s *storeServer) GetLatest(ctx context.Context, req *pb.GetLatestRequest) (
 	if err != nil {
 		return nil, err
 	}
+
 	r.ObservedAt = observed.Format(time.RFC3339)
 	return &pb.GetLatestResponse{Reading: &r, Found: true}, nil
 }
 
 // seedCities inserts the initial CITIES list into the cities table once,
 // so the very first boot has something to show before anyone adds a city
-// through the UI. Safe to call every startup - ON CONFLICT DO NOTHING.
+// through the UI. Safe to call on every startup, not just the first one -
+// ON CONFLICT DO NOTHING means re-running this against an already-seeded
+// database is a harmless no-op.
 func seedCities(db *sql.DB, csv string) {
 	for _, c := range parseCities(csv) {
 		_, err := db.Exec(

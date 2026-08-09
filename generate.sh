@@ -2,6 +2,15 @@
 # ---------------------------------------------------------------------------
 # generate.sh  -  scaffolds the whole Docker Compose weather stack.
 # Pure bash generator (no Python). Run:  bash generate.sh
+#
+# This file lives inside the repo as a reference for how the project was
+# originally scaffolded - it's not meant to be re-run here. Doing so would
+# delete this whole folder (including this script) before recreating it,
+# since ROOT below is a relative path and this script doesn't write a copy
+# of itself back into its own output.
+#
+# To actually use it, copy it out to an empty directory first:
+#   mkdir /tmp/regen && cp generate.sh /tmp/regen/ && cd /tmp/regen && bash generate.sh
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -394,17 +403,20 @@ import (
 	"encoding/json"
 	"log"
 	"net"
-	"net/http"
 	"time"
 
 	pb "weather/genproto"
 
 	_ "github.com/lib/pq"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 )
 
+// storeServer implements the WeatherStore gRPC service (AddReading,
+// GetLatest below). This is the only thing in the whole project that
+// talks to Postgres and Redis directly for weather readings - api and
+// consumer only ever reach that data through this gRPC interface. (The
+// `cities` table is a separate, simpler case - see store_http.go.)
 type storeServer struct {
 	pb.UnimplementedWeatherStoreServer
 	db  *sql.DB
@@ -412,7 +424,29 @@ type storeServer struct {
 	ttl time.Duration
 }
 
+// runStore is the entire life of the `store` mode: connect to Postgres,
+// connect to Redis, seed the cities table on first boot, then start both
+// servers - the REST one (store_http.go) in the background, the gRPC one
+// in the foreground.
 func runStore() {
+	db := mustConnectPostgres()
+
+	rdb := redis.NewClient(&redis.Options{Addr: getenv("REDIS_ADDR", "redis:6379")})
+	srv := &storeServer{db: db, rdb: rdb, ttl: mustDuration("CACHE_TTL", "120s")}
+	seedCities(db, getenv("CITIES", ""))
+
+	go serveStoreHTTP(db)
+
+	serveGRPC(srv)
+}
+
+// mustConnectPostgres retries the connection up to 30 times, 2 seconds
+// apart, before giving up. This matters because Docker Compose starts
+// containers in parallel by default - by the time this process starts,
+// the postgres container may exist but Postgres itself might not have
+// finished initializing yet. "must" because there's nothing useful this
+// service can do without a database.
+func mustConnectPostgres() *sql.DB {
 	dsn := "host=" + getenv("PGHOST", "postgres") +
 		" port=" + getenv("PGPORT", "5432") +
 		" user=" + getenv("POSTGRES_USER", "weather") +
@@ -420,88 +454,30 @@ func runStore() {
 		" dbname=" + getenv("POSTGRES_DB", "weatherdb") +
 		" sslmode=disable"
 
+	const attempts = 30
+	const delay = 2 * time.Second
+
 	var db *sql.DB
 	var err error
-	for i := 0; i < 30; i++ {
+	for i := 0; i < attempts; i++ {
 		db, err = sql.Open("postgres", dsn)
 		if err == nil {
 			err = db.Ping()
 		}
 		if err == nil {
-			break
+			log.Println("store: connected to postgres")
+			return db
 		}
 		log.Printf("store: waiting for postgres: %v", err)
-		time.Sleep(2 * time.Second)
+		time.Sleep(delay)
 	}
-	if err != nil {
-		log.Fatalf("store: cannot connect to postgres: %v", err)
-	}
-	log.Println("store: connected to postgres")
+	log.Fatalf("store: cannot connect to postgres: %v", err)
+	return nil // unreachable - log.Fatalf exits the process
+}
 
-	rdb := redis.NewClient(&redis.Options{Addr: getenv("REDIS_ADDR", "redis:6379")})
-	srv := &storeServer{db: db, rdb: rdb, ttl: mustDuration("CACHE_TTL", "120s")}
-	seedCities(db, getenv("CITIES", ""))
-
-	// health + metrics endpoint used by the healthcheck and Prometheus
-	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("ok"))
-		})
-		mux.Handle("/metrics", promhttp.Handler())
-
-		// /cities is store's own small REST surface (separate from the gRPC
-		// service above) - it's the only thing that touches the `cities`
-		// table, keeping the "only store touches Postgres" rule intact.
-		mux.HandleFunc("/cities", func(w http.ResponseWriter, r *http.Request) {
-			switch r.Method {
-			case http.MethodGet:
-				rows, err := db.Query(`SELECT name, latitude, longitude FROM cities ORDER BY name`)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-				defer rows.Close()
-				out := []cityCoord{}
-				for rows.Next() {
-					var c cityCoord
-					if err := rows.Scan(&c.Name, &c.Lat, &c.Lon); err == nil {
-						out = append(out, c)
-					}
-				}
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(out)
-
-			case http.MethodPost:
-				var c cityCoord
-				if err := json.NewDecoder(r.Body).Decode(&c); err != nil || c.Name == "" {
-					http.Error(w, "invalid city payload", http.StatusBadRequest)
-					return
-				}
-				_, err := db.Exec(
-					`INSERT INTO cities (name, latitude, longitude) VALUES ($1,$2,$3)
-					 ON CONFLICT (name) DO UPDATE SET latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude`,
-					c.Name, c.Lat, c.Lon)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-				log.Printf("store: city added/updated: %s (%.4f, %.4f)", c.Name, c.Lat, c.Lon)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(c)
-
-			default:
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			}
-		})
-
-		log.Println("store: health+metrics on :9091")
-		if err := http.ListenAndServe(":9091", mux); err != nil {
-			log.Printf("store: health server: %v", err)
-		}
-	}()
-
+// serveGRPC starts the WeatherStore gRPC server and blocks forever (or
+// until it fails). Meant to be the last thing runStore calls.
+func serveGRPC(srv *storeServer) {
 	lis, err := net.Listen("tcp", ":9090")
 	if err != nil {
 		log.Fatalf("store: listen: %v", err)
@@ -514,7 +490,11 @@ func runStore() {
 	}
 }
 
-// AddReading inserts a reading, refreshes the Redis cache, bumps metrics.
+// AddReading is the write path: insert into Postgres (the permanent
+// record), then best-effort refresh the Redis cache. If the cache write
+// fails, that's not treated as an error - GetLatest below will just fall
+// back to Postgres on its next call, so a Redis hiccup here never loses
+// the actual reading.
 func (s *storeServer) AddReading(ctx context.Context, r *pb.Reading) (*pb.AddReadingResponse, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx,
@@ -526,15 +506,21 @@ func (s *storeServer) AddReading(ctx context.Context, r *pb.Reading) (*pb.AddRea
 	if err != nil {
 		return nil, err
 	}
+
 	if b, e := json.Marshal(r); e == nil {
 		s.rdb.Set(ctx, "latest:"+r.City, b, s.ttl)
 	}
+
 	storedTotal.Inc()
 	log.Printf("store: saved id=%d city=%s temp=%.1f", id, r.City, r.TemperatureC)
 	return &pb.AddReadingResponse{Id: id}, nil
 }
 
-// GetLatest returns the newest reading for a city (cache first, then Postgres).
+// GetLatest is the read path: Redis first (the fast, common case), and
+// only fall back to Postgres on a cache miss. A miss happens either
+// because CACHE_TTL expired naturally, or because Redis was restarted and
+// lost its data - Postgres being the permanent record means neither case
+// ever actually loses a reading, just costs one extra query.
 func (s *storeServer) GetLatest(ctx context.Context, req *pb.GetLatestRequest) (*pb.GetLatestResponse, error) {
 	if v, err := s.rdb.Get(ctx, "latest:"+req.City).Result(); err == nil {
 		var r pb.Reading
@@ -542,6 +528,7 @@ func (s *storeServer) GetLatest(ctx context.Context, req *pb.GetLatestRequest) (
 			return &pb.GetLatestResponse{Reading: &r, Found: true}, nil
 		}
 	}
+
 	var r pb.Reading
 	var observed time.Time
 	err := s.db.QueryRowContext(ctx,
@@ -554,13 +541,16 @@ func (s *storeServer) GetLatest(ctx context.Context, req *pb.GetLatestRequest) (
 	if err != nil {
 		return nil, err
 	}
+
 	r.ObservedAt = observed.Format(time.RFC3339)
 	return &pb.GetLatestResponse{Reading: &r, Found: true}, nil
 }
 
 // seedCities inserts the initial CITIES list into the cities table once,
 // so the very first boot has something to show before anyone adds a city
-// through the UI. Safe to call every startup - ON CONFLICT DO NOTHING.
+// through the UI. Safe to call on every startup, not just the first one -
+// ON CONFLICT DO NOTHING means re-running this against an already-seeded
+// database is a harmless no-op.
 func seedCities(db *sql.DB, csv string) {
 	for _, c := range parseCities(csv) {
 		_, err := db.Exec(
@@ -574,46 +564,305 @@ func seedCities(db *sql.DB, csv string) {
 
 WEOF
 
+cat > "$ROOT/app/store_http.go" <<'WEOF'
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"log"
+	"net/http"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// storeHTTPServer is store's small REST surface - separate from the gRPC
+// service in store.go. Three routes, all on :9091:
+//
+//	/healthz  - polled by the Docker healthcheck in docker-compose.yml
+//	/metrics  - scraped by Prometheus
+//	/cities   - the only place in this whole project that runs SQL
+//	            against the `cities` table (api reaches it over plain
+//	            HTTP, not gRPC, since it's simple key-value-ish data with
+//	            no need for a typed contract)
+type storeHTTPServer struct {
+	db *sql.DB
+}
+
+// serveStoreHTTP wires up the three routes and listens forever. Meant to
+// be started with `go serveStoreHTTP(db)` from runStore, alongside the
+// gRPC server.
+func serveStoreHTTP(db *sql.DB) {
+	s := &storeHTTPServer{db: db}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/cities", s.handleCities)
+
+	log.Println("store: health+metrics on :9091")
+	if err := http.ListenAndServe(":9091", mux); err != nil {
+		log.Printf("store: health server: %v", err)
+	}
+}
+
+func (s *storeHTTPServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
+}
+
+// handleCities dispatches to the GET or POST version - same "keep it tiny"
+// reasoning as apiServer.handleCities in http_handlers.go.
+func (s *storeHTTPServer) handleCities(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleCitiesGet(w, r)
+	case http.MethodPost:
+		s.handleCitiesPost(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleCitiesGet returns every row in the cities table, alphabetically.
+// This is what api's listCities (city_cache.go) calls to refresh its cache.
+func (s *storeHTTPServer) handleCitiesGet(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Query(`SELECT name, latitude, longitude FROM cities ORDER BY name`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	out := []cityCoord{}
+	for rows.Next() {
+		var c cityCoord
+		if err := rows.Scan(&c.Name, &c.Lat, &c.Lon); err == nil {
+			out = append(out, c)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+// handleCitiesPost inserts a new city, or updates its coordinates if the
+// name already exists (ON CONFLICT ... DO UPDATE) - so re-adding "Paris"
+// twice is harmless, it just refreshes the stored coordinates rather than
+// erroring. The caller (api's addCityToStore) is expected to have already
+// resolved the name to coordinates via geocoding before this is ever
+// called - this endpoint trusts the coordinates it's given.
+func (s *storeHTTPServer) handleCitiesPost(w http.ResponseWriter, r *http.Request) {
+	var c cityCoord
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil || c.Name == "" {
+		http.Error(w, "invalid city payload", http.StatusBadRequest)
+		return
+	}
+
+	_, err := s.db.Exec(
+		`INSERT INTO cities (name, latitude, longitude) VALUES ($1,$2,$3)
+		 ON CONFLICT (name) DO UPDATE SET latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude`,
+		c.Name, c.Lat, c.Lon)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("store: city added/updated: %s (%.4f, %.4f)", c.Name, c.Lat, c.Lon)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(c)
+}
+
+WEOF
+
 # ============================== app/api.go ==================================
 cat > "$ROOT/app/api.go" <<'WEOF'
 package main
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
-	"net/url"
-	"strconv"
-	"strings"
-	"sync"
 	"time"
 
 	pb "weather/genproto"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	amqp "github.com/rabbitmq/amqp091-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+// apiConfig is every environment-derived setting runAPI needs, gathered in
+// one place so the rest of this file reads configuration once, up front,
+// instead of calling getenv() scattered throughout.
+type apiConfig struct {
+	amqpURL   string
+	queue     string
+	interval  time.Duration
+	storeAddr string // gRPC address, e.g. "weather-store:9090"
+	storeHTTP string // REST base URL, e.g. "http://weather-store:9091"
+}
+
+func loadAPIConfig() apiConfig {
+	return apiConfig{
+		amqpURL: fmt.Sprintf("amqp://%s:%s@%s:%s/",
+			getenv("RABBITMQ_DEFAULT_USER", "admin"),
+			getenv("RABBITMQ_DEFAULT_PASS", ""),
+			getenv("AMQP_HOST", "rabbitmq"),
+			getenv("AMQP_PORT", "5672")),
+		queue:     getenv("QUEUE", "weather.readings"),
+		interval:  mustDuration("FETCH_INTERVAL", "300s"),
+		storeAddr: getenv("STORE_ADDR", "weather-store:9090"),
+		storeHTTP: getenv("STORE_HTTP_ADDR", "http://weather-store:9091"),
+	}
+}
+
+// runAPI is the entire life of the `api` mode, top to bottom: load config,
+// connect to store, make sure we know the current city list, then start
+// the two things that run forever - the HTTP server and the fetch loop.
+//
+// Each step below is its own small function purely so this one reads like
+// a table of contents. If you want the details of any one step, go to that
+// function - you shouldn't need to read this whole thing to understand any
+// single part of it.
+func runAPI() {
+	cfg := loadAPIConfig()
+
+	conn := mustDialStore(cfg.storeAddr)
+	defer conn.Close()
+	store := pb.NewWeatherStoreClient(conn)
+
+	waitForInitialCityList(cfg.storeHTTP)
+	go refreshCityListPeriodically(cfg.storeHTTP)
+	go serveHTTP(store, cfg.storeHTTP)
+
+	runFetchLoop(cfg)
+}
+
+// mustDialStore opens the gRPC connection to weather-store. "must" because
+// there's nothing sensible to do if this fails at startup - api can't work
+// at all without a store client, so we fail loudly and let Docker's
+// restart policy try again.
+func mustDialStore(addr string) *grpc.ClientConn {
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("api: cannot create store client: %v", err)
+	}
+	return conn
+}
+
+// waitForInitialCityList blocks until store answers with a real city list,
+// so the very first fetch cycle has actual cities to work with instead of
+// an empty one. Retries because store itself might still be starting -
+// Docker starts containers in parallel, it doesn't wait for dependencies
+// to be fully ready by default.
+func waitForInitialCityList(storeHTTP string) {
+	const attempts = 30
+	const delay = 2 * time.Second
+
+	for i := 0; i < attempts; i++ {
+		if list, err := listCities(storeHTTP); err == nil {
+			setCities(list)
+			return
+		}
+		time.Sleep(delay)
+	}
+	log.Printf("api: could not reach store for initial city list after %d attempts, starting with an empty list", attempts)
+}
+
+// refreshCityListPeriodically keeps the in-memory cache in sync with
+// Postgres for as long as the process runs. This is what makes a city
+// added directly in the database (outside this app's own UI) eventually
+// show up here too, without a restart. Intended to run in its own
+// goroutine (`go refreshCityListPeriodically(...)`) - it never returns.
+func refreshCityListPeriodically(storeHTTP string) {
+	const interval = 30 * time.Second
+	for {
+		time.Sleep(interval)
+		if list, err := listCities(storeHTTP); err == nil {
+			setCities(list)
+		}
+	}
+}
+
+// runFetchLoop is the heartbeat of the whole app: every FETCH_INTERVAL,
+// fetch and publish weather for whatever cities are currently tracked.
+// Never returns - this is meant to be the last thing runAPI calls.
+func runFetchLoop(cfg apiConfig) {
+	log.Printf("api: fetch loop every %s", cfg.interval)
+	for {
+		publishAll(cfg.amqpURL, cfg.queue, getCities())
+		time.Sleep(cfg.interval)
+	}
+}
+
+WEOF
+
+cat > "$ROOT/app/city_cache.go" <<'WEOF'
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// cityCoord is a city name plus the coordinates Open-Meteo needs to fetch
+// its weather. This is the one shared "city" shape used everywhere in the
+// api binary - the cache below, the HTTP calls to store, and the JSON sent
+// to the browser all use this same struct.
 type cityCoord struct {
 	Name string
 	Lat  float64
 	Lon  float64
 }
 
-// activeCities is a simple cache of the city list, always sourced from
-// Postgres (via store's /cities) - CITIES env is only ever used once, by
-// store, to seed the table on first boot. Never read from env here.
+// parseCities turns the CITIES env var format ("Name:lat:lon,Name:lat:lon")
+// into a slice of cityCoord. Used exactly once, by store, to seed the
+// database on the very first boot (see seedCities in store.go) - nothing
+// in api.go should ever call this to build its working city list; that
+// always comes from the database (see listCities below).
+//
+// Malformed entries (wrong number of ":"-separated parts) are silently
+// skipped rather than crashing the whole app over one typo in .env.
+func parseCities(s string) []cityCoord {
+	var out []cityCoord
+	for _, part := range strings.Split(s, ",") {
+		fields := strings.Split(strings.TrimSpace(part), ":")
+		if len(fields) != 3 {
+			continue
+		}
+		lat, _ := strconv.ParseFloat(fields[1], 64)
+		lon, _ := strconv.ParseFloat(fields[2], 64)
+		out = append(out, cityCoord{Name: fields[0], Lat: lat, Lon: lon})
+	}
+	return out
+}
+
+// --- in-memory cache -------------------------------------------------------
+//
+// activeCities is api's own local copy of "which cities are we tracking."
+// It exists purely so the fetch loop and the HTTP handlers don't have to
+// make a network call to store every single time they need the list.
+//
+// The database (via store's /cities endpoint) is always the source of
+// truth. This cache is refreshed from the database - at startup, every 30
+// seconds, and immediately whenever a city is added through the UI - it is
+// never the other way around. If you're tempted to update activeCities by
+// hand (e.g. "just append the new city"), don't: re-read from the database
+// instead, so the cache can never drift from what's actually stored.
+
 var (
 	citiesMu     sync.RWMutex
 	activeCities []cityCoord
 )
 
+// getCities returns a snapshot of the current city list. It copies the
+// slice before returning it so callers can't accidentally mutate the
+// cache's backing array through the returned slice.
 func getCities() []cityCoord {
 	citiesMu.RLock()
 	defer citiesMu.RUnlock()
@@ -622,15 +871,25 @@ func getCities() []cityCoord {
 	return out
 }
 
-func setCities(c []cityCoord) {
+// setCities replaces the cached list wholesale. Always call this with a
+// list that just came from the database (listCities below) - never with a
+// hand-edited copy of the old list.
+func setCities(cities []cityCoord) {
 	citiesMu.Lock()
-	activeCities = c
+	activeCities = cities
 	citiesMu.Unlock()
 }
 
-// listCities always reads the current city list straight from store's
-// /cities (Postgres). Called at startup and periodically to refresh the
-// cache above - insert into the DB, then re-read the DB, nothing fancier.
+// --- talking to store's /cities endpoint ------------------------------------
+//
+// store owns the `cities` table in Postgres and is the only thing allowed
+// to touch it directly (same rule as weather_readings). api reaches it
+// through store's small REST surface on :9091, not gRPC - these two
+// functions are the entire interface.
+
+// listCities reads the full, current city list straight from the database.
+// This is the only way api's cache ever learns about a city - whether it
+// was added through this app's own UI or inserted directly with psql.
 func listCities(storeHTTP string) ([]cityCoord, error) {
 	client := http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(storeHTTP + "/cities")
@@ -638,18 +897,21 @@ func listCities(storeHTTP string) ([]cityCoord, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("store /cities: status %d", resp.StatusCode)
 	}
-	var out []cityCoord
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	var cities []cityCoord
+	if err := json.NewDecoder(resp.Body).Decode(&cities); err != nil {
 		return nil, err
 	}
-	return out, nil
+	return cities, nil
 }
 
-// addCityToStore POSTs a resolved city (name + coordinates) to store, which
-// persists it in Postgres (INSERT ... ON CONFLICT DO UPDATE).
+// addCityToStore asks store to persist a new city (name + coordinates
+// already resolved by geocodeCity). store does the actual
+// INSERT ... ON CONFLICT DO UPDATE - this function just makes the HTTP call
+// and turns a non-200 response into a Go error.
 func addCityToStore(storeHTTP string, c cityCoord) error {
 	body, _ := json.Marshal(c)
 	client := http.Client{Timeout: 5 * time.Second}
@@ -658,23 +920,61 @@ func addCityToStore(storeHTTP string, c cityCoord) error {
 		return err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("store /cities: status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		errBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("store /cities: status %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
 	}
 	return nil
 }
 
-// geocodeCity resolves a plain city name to coordinates via Open-Meteo's
-// free geocoding API - no API key required. Returns the first match.
+WEOF
+
+cat > "$ROOT/app/weather_fetch.go" <<'WEOF'
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+// reading is one weather observation for one city. This is what gets
+// published to RabbitMQ, what store persists to Postgres, and what
+// /readings/latest returns to the browser - the JSON tags below are the
+// public API shape, so change them with care.
+type reading struct {
+	City         string  `json:"city"`
+	Latitude     float64 `json:"latitude"`
+	Longitude    float64 `json:"longitude"`
+	TemperatureC float64 `json:"temperature_c"`
+	WindspeedKph float64 `json:"windspeed_kph"`
+	ObservedAt   string  `json:"observed_at"`
+	Source       string  `json:"source"`
+}
+
+// geocodeCity turns a plain city name (whatever the user typed in the
+// search box) into coordinates, using Open-Meteo's free geocoding API - no
+// account or API key needed. It returns only the single best match; if the
+// name is ambiguous ("Springfield") this just picks whichever result the
+// API ranks first rather than asking the user to disambiguate.
 func geocodeCity(name string) (cityCoord, error) {
-	u := "https://geocoding-api.open-meteo.com/v1/search?count=1&name=" + url.QueryEscape(name)
+	endpoint := "https://geocoding-api.open-meteo.com/v1/search?count=1&name=" + url.QueryEscape(name)
 	client := http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(u)
+
+	resp, err := client.Get(endpoint)
 	if err != nil {
 		return cityCoord{}, err
 	}
 	defer resp.Body.Close()
+
 	var parsed struct {
 		Results []struct {
 			Name      string  `json:"name"`
@@ -689,200 +989,146 @@ func geocodeCity(name string) (cityCoord, error) {
 	if len(parsed.Results) == 0 {
 		return cityCoord{}, fmt.Errorf("no match found for %q", name)
 	}
-	r := parsed.Results[0]
-	return cityCoord{Name: r.Name, Lat: r.Latitude, Lon: r.Longitude}, nil
+
+	first := parsed.Results[0]
+	return cityCoord{Name: first.Name, Lat: first.Latitude, Lon: first.Longitude}, nil
 }
 
-type reading struct {
-	City         string  `json:"city"`
-	Latitude     float64 `json:"latitude"`
-	Longitude    float64 `json:"longitude"`
-	TemperatureC float64 `json:"temperature_c"`
-	WindspeedKph float64 `json:"windspeed_kph"`
-	ObservedAt   string  `json:"observed_at"`
-	Source       string  `json:"source"`
-}
+// fetchOne calls Open-Meteo's forecast API for a single city and returns
+// its current conditions. This is the one function that actually knows the
+// shape of Open-Meteo's forecast response - everywhere else in this
+// codebase deals with the simpler `reading` struct instead.
+func fetchOne(c cityCoord) (reading, error) {
+	endpoint := fmt.Sprintf(
+		"https://api.open-meteo.com/v1/forecast?latitude=%f&longitude=%f&current_weather=true",
+		c.Lat, c.Lon)
 
-func parseCities(s string) []cityCoord {
-	var out []cityCoord
-	for _, part := range strings.Split(s, ",") {
-		f := strings.Split(strings.TrimSpace(part), ":")
-		if len(f) != 3 {
-			continue
-		}
-		lat, _ := strconv.ParseFloat(f[1], 64)
-		lon, _ := strconv.ParseFloat(f[2], 64)
-		out = append(out, cityCoord{Name: f[0], Lat: lat, Lon: lon})
-	}
-	return out
-}
-
-func runAPI() {
-	amqpURL := fmt.Sprintf("amqp://%s:%s@%s:%s/",
-		getenv("RABBITMQ_DEFAULT_USER", "admin"),
-		getenv("RABBITMQ_DEFAULT_PASS", ""),
-		getenv("AMQP_HOST", "rabbitmq"),
-		getenv("AMQP_PORT", "5672"))
-	queue := getenv("QUEUE", "weather.readings")
-	interval := mustDuration("FETCH_INTERVAL", "300s")
-	storeAddr := getenv("STORE_ADDR", "weather-store:9090")
-	storeHTTP := getenv("STORE_HTTP_ADDR", "http://weather-store:9091")
-
-	conn, err := grpc.NewClient(storeAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	client := http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(endpoint)
 	if err != nil {
-		log.Fatalf("api: cannot create store client: %v", err)
+		return reading{}, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var parsed struct {
+		CurrentWeather struct {
+			Temperature float64 `json:"temperature"`
+			Windspeed   float64 `json:"windspeed"`
+			Time        string  `json:"time"`
+		} `json:"current_weather"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return reading{}, err
+	}
+
+	return reading{
+		City:         c.Name,
+		Latitude:     c.Lat,
+		Longitude:    c.Lon,
+		TemperatureC: parsed.CurrentWeather.Temperature,
+		WindspeedKph: parsed.CurrentWeather.Windspeed,
+		ObservedAt:   parsed.CurrentWeather.Time,
+		Source:       "open-meteo",
+	}, nil
+}
+
+// publishAll is the regular fetch cycle: for every city currently being
+// tracked, fetch its weather from Open-Meteo and publish it onto the
+// RabbitMQ queue for weather-consumer to pick up and store. One failed
+// city (a bad network blip, Open-Meteo briefly down) just gets logged and
+// skipped - it doesn't abort the whole cycle for every other city.
+//
+// A fresh AMQP connection is opened on every call rather than kept open
+// between cycles - simple, and fine at the default 5-minute interval. Worth
+// revisiting (a persistent connection) if FETCH_INTERVAL is ever set much
+// shorter than that.
+func publishAll(amqpURL, queue string, cities []cityCoord) {
+	conn, err := amqp.Dial(amqpURL)
+	if err != nil {
+		log.Printf("api: amqp dial: %v", err)
+		return
 	}
 	defer conn.Close()
-	store := pb.NewWeatherStoreClient(conn)
 
-	// The city list always comes from Postgres, via store's /cities -
-	// never from CITIES directly here. CITIES is only ever used once, by
-	// store, to seed the table on first boot (see seedCities in store.go).
-	// Retry until store is up, since it may still be starting.
-	for i := 0; i < 30; i++ {
-		if list, err := listCities(storeHTTP); err == nil {
-			setCities(list)
-			break
-		}
-		time.Sleep(2 * time.Second)
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Printf("api: channel: %v", err)
+		return
+	}
+	defer ch.Close()
+
+	if _, err := ch.QueueDeclare(queue, true, false, false, false, nil); err != nil {
+		log.Printf("api: queue declare: %v", err)
+		return
 	}
 
-	// Periodic cache refresh, still DB-sourced: picks up cities added
-	// through the UI (or directly in Postgres) without a restart.
-	go func() {
-		for {
-			time.Sleep(30 * time.Second)
-			if list, err := listCities(storeHTTP); err == nil {
-				setCities(list)
-			}
+	for _, c := range cities {
+		rd, err := fetchOne(c)
+		if err != nil {
+			log.Printf("api: fetch %s: %v", c.Name, err)
+			continue
 		}
-	}()
 
-	go serveHTTP(store, storeHTTP)
+		body, _ := json.Marshal(rd)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err = ch.PublishWithContext(ctx, "", queue, false, false, amqp.Publishing{
+			ContentType: "application/json",
+			Body:        body,
+		})
+		cancel()
+		if err != nil {
+			log.Printf("api: publish %s: %v", c.Name, err)
+			continue
+		}
 
-	log.Printf("api: fetch loop every %s", interval)
-	for {
-		publishAll(amqpURL, queue, getCities())
-		time.Sleep(interval)
+		tempGauge.WithLabelValues(rd.City).Set(rd.TemperatureC)
+		windGauge.WithLabelValues(rd.City).Set(rd.WindspeedKph)
+		publishedTotal.Inc()
+		log.Printf("api: published %s temp=%.1f", rd.City, rd.TemperatureC)
 	}
 }
 
+WEOF
+
+cat > "$ROOT/app/http_handlers.go" <<'WEOF'
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	pb "weather/genproto"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// apiServer bundles what the HTTP handlers below need. Grouping these two
+// values here (instead of each handler being an anonymous closure that
+// captures whatever variables happen to be in scope in serveHTTP) means
+// every handler's dependencies are explicit and each one can be read - and
+// tested - on its own.
+type apiServer struct {
+	store     pb.WeatherStoreClient // gRPC client to weather-store
+	storeHTTP string                // e.g. "http://weather-store:9091"
+}
+
+// serveHTTP wires up every route and starts listening. This is the only
+// exported entry point from this file - everything else here is a method
+// on apiServer that some route below points to.
 func serveHTTP(store pb.WeatherStoreClient, storeHTTP string) {
+	s := &apiServer{store: store, storeHTTP: storeHTTP}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	})
+	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/readings/latest", func(w http.ResponseWriter, r *http.Request) {
-		var names []string
-		if q := r.URL.Query().Get("city"); q != "" {
-			names = []string{q}
-		} else {
-			for _, c := range getCities() {
-				names = append(names, c.Name)
-			}
-		}
-		out := []reading{}
-		for _, name := range names {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			resp, err := store.GetLatest(ctx, &pb.GetLatestRequest{City: name})
-			cancel()
-			if err != nil {
-				log.Printf("api: getLatest %s: %v", name, err)
-				continue
-			}
-			if resp.Found && resp.Reading != nil {
-				out = append(out, reading{
-					City:         resp.Reading.City,
-					Latitude:     resp.Reading.Latitude,
-					Longitude:    resp.Reading.Longitude,
-					TemperatureC: resp.Reading.TemperatureC,
-					WindspeedKph: resp.Reading.WindspeedKph,
-					ObservedAt:   resp.Reading.ObservedAt,
-					Source:       resp.Reading.Source,
-				})
-			}
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(out)
-	})
-
-	// GET /cities  - the current active list (Postgres-backed via store).
-	// POST /cities - add a new city by name only; we geocode it ourselves.
-	mux.HandleFunc("/cities", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(getCities())
-
-		case http.MethodPost:
-			var body struct {
-				Name string `json:"name"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
-				http.Error(w, "provide a city name", http.StatusBadRequest)
-				return
-			}
-			c, err := geocodeCity(strings.TrimSpace(body.Name))
-			if err != nil {
-				http.Error(w, "could not resolve city: "+err.Error(), http.StatusBadRequest)
-				return
-			}
-			if err := addCityToStore(storeHTTP, c); err != nil {
-				http.Error(w, "could not save city: "+err.Error(), http.StatusBadGateway)
-				return
-			}
-
-			// Insert done - now just re-read the list from the database,
-			// rather than guessing/patching the in-memory cache by hand.
-			if list, err := listCities(storeHTTP); err == nil {
-				setCities(list)
-			}
-
-			// Get the temperature right away instead of waiting for the
-			// next scheduled FETCH_INTERVAL cycle.
-			if rd, err := fetchOne(c); err != nil {
-				log.Printf("api: immediate fetch for %s failed: %v", c.Name, err)
-			} else {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_, err := store.AddReading(ctx, &pb.Reading{
-					City:         rd.City,
-					Latitude:     rd.Latitude,
-					Longitude:    rd.Longitude,
-					TemperatureC: rd.TemperatureC,
-					WindspeedKph: rd.WindspeedKph,
-					ObservedAt:   rd.ObservedAt,
-					Source:       rd.Source,
-				})
-				cancel()
-				if err != nil {
-					log.Printf("api: immediate reading store for %s: %v", c.Name, err)
-				} else {
-					tempGauge.WithLabelValues(rd.City).Set(rd.TemperatureC)
-					windGauge.WithLabelValues(rd.City).Set(rd.WindspeedKph)
-					publishedTotal.Inc()
-				}
-			}
-
-			log.Printf("api: city added: %s (%.4f, %.4f)", c.Name, c.Lat, c.Lon)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(c)
-
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-
-	// GET / - a single dark-themed page to look up a city's current
-	// weather, and add new cities by name (geocoded automatically).
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(weatherUIHTML))
-	})
+	mux.HandleFunc("/readings/latest", s.handleReadingsLatest)
+	mux.HandleFunc("/cities", s.handleCities)
+	mux.HandleFunc("/", s.handleIndex)
 
 	addr := ":" + getenv("API_PORT", "8080")
 	log.Println("api: http on", addr)
@@ -891,6 +1137,226 @@ func serveHTTP(store pb.WeatherStoreClient, storeHTTP string) {
 	}
 }
 
+// handleHealthz is what the Docker healthcheck in docker-compose.yml polls.
+func (s *apiServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("ok"))
+}
+
+// handleIndex serves the single-page UI (search box + add-city form). The
+// page itself is entirely static HTML/CSS/JS - see ui_page.go - it talks
+// back to this server only through the JSON endpoints below.
+func (s *apiServer) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(weatherUIHTML))
+}
+
+// --- GET /readings/latest ---------------------------------------------------
+
+// handleReadingsLatest answers "what's the current weather", either for one
+// city (?city=Paris) or for every tracked city (no query string - used by
+// nothing right now except manual testing/curl, since the UI always asks
+// for one city at a time).
+func (s *apiServer) handleReadingsLatest(w http.ResponseWriter, r *http.Request) {
+	names := s.cityNamesFromRequest(r)
+
+	out := []reading{}
+	for _, name := range names {
+		if rd, found := s.getLatestFromStore(name); found {
+			out = append(out, rd)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+// cityNamesFromRequest decides which cities handleReadingsLatest should
+// look up: just the one named in ?city=, or the entire tracked list.
+func (s *apiServer) cityNamesFromRequest(r *http.Request) []string {
+	if q := r.URL.Query().Get("city"); q != "" {
+		return []string{q}
+	}
+	var names []string
+	for _, c := range getCities() {
+		names = append(names, c.Name)
+	}
+	return names
+}
+
+// getLatestFromStore asks weather-store (over gRPC) for the newest reading
+// it has for one city. The bool return is "did we actually get a reading",
+// not "did the call succeed" - a city with no data yet is not an error.
+func (s *apiServer) getLatestFromStore(name string) (reading, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := s.store.GetLatest(ctx, &pb.GetLatestRequest{City: name})
+	if err != nil {
+		log.Printf("api: getLatest %s: %v", name, err)
+		return reading{}, false
+	}
+	if !resp.Found || resp.Reading == nil {
+		return reading{}, false
+	}
+
+	return reading{
+		City:         resp.Reading.City,
+		Latitude:     resp.Reading.Latitude,
+		Longitude:    resp.Reading.Longitude,
+		TemperatureC: resp.Reading.TemperatureC,
+		WindspeedKph: resp.Reading.WindspeedKph,
+		ObservedAt:   resp.Reading.ObservedAt,
+		Source:       resp.Reading.Source,
+	}, true
+}
+
+// --- GET/POST /cities --------------------------------------------------------
+
+// handleCities just dispatches to the GET or POST version - kept tiny on
+// purpose so the two very different jobs ("list what we have" vs. "resolve
+// and add something new") don't end up tangled in one function.
+func (s *apiServer) handleCities(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleCitiesGet(w, r)
+	case http.MethodPost:
+		s.handleCitiesPost(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleCitiesGet returns the currently tracked cities - straight from the
+// in-memory cache (city_cache.go), which is itself always sourced from the
+// database, never from CITIES.
+func (s *apiServer) handleCitiesGet(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(getCities())
+}
+
+// handleCitiesPost is the "+ Add city" flow from the UI. The request body
+// is just {"name": "Paris"} - the user never supplies coordinates - so this
+// is the one place that ties together geocoding, persisting, and getting
+// an immediate first reading, in that order:
+//
+//  1. resolve the name to coordinates (geocodeCity)
+//  2. persist it (addCityToStore -> store -> Postgres)
+//  3. re-read the full list from the database, so the cache reflects
+//     reality instead of being hand-patched with the one new entry
+//  4. fetch and store a reading right away, so the user isn't staring at
+//     "no data yet" until the next scheduled FETCH_INTERVAL cycle
+//
+// Step 4 failing (e.g. Open-Meteo hiccups) does not fail the request - the
+// city is already saved by that point, and it'll just pick up a reading on
+// the next regular cycle instead.
+func (s *apiServer) handleCitiesPost(w http.ResponseWriter, r *http.Request) {
+	name, err := decodeCityName(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	city, err := geocodeCity(name)
+	if err != nil {
+		http.Error(w, "could not resolve city: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := addCityToStore(s.storeHTTP, city); err != nil {
+		http.Error(w, "could not save city: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	s.refreshCitiesFromDB()
+	s.fetchAndStoreNow(city)
+
+	log.Printf("api: city added: %s (%.4f, %.4f)", city.Name, city.Lat, city.Lon)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(city)
+}
+
+// decodeCityName pulls {"name": "..."} out of the request body, rejecting
+// anything blank or malformed before it ever reaches geocoding.
+func decodeCityName(r *http.Request) (string, error) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return "", errProvideCityName
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		return "", errProvideCityName
+	}
+	return name, nil
+}
+
+var errProvideCityName = httpError("provide a city name")
+
+// httpError is just a tiny named string type so decodeCityName's error can
+// double as the exact text http.Error sends to the client - no separate
+// "wrap it, then unwrap it for the message" step needed for a case this
+// simple.
+type httpError string
+
+func (e httpError) Error() string { return string(e) }
+
+// refreshCitiesFromDB re-reads the full city list from the database and
+// replaces the cache with it. Called right after adding a city so the new
+// one is visible immediately, instead of waiting for the periodic 30s
+// refresh in runAPI (api.go).
+func (s *apiServer) refreshCitiesFromDB() {
+	if list, err := listCities(s.storeHTTP); err == nil {
+		setCities(list)
+	}
+}
+
+// fetchAndStoreNow fetches one city's current weather and writes it
+// straight to the database via the same gRPC AddReading call the normal
+// consumer pipeline uses - this is the "don't make them wait 5 minutes"
+// shortcut described on handleCitiesPost above.
+func (s *apiServer) fetchAndStoreNow(c cityCoord) {
+	rd, err := fetchOne(c)
+	if err != nil {
+		log.Printf("api: immediate fetch for %s failed: %v", c.Name, err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = s.store.AddReading(ctx, &pb.Reading{
+		City:         rd.City,
+		Latitude:     rd.Latitude,
+		Longitude:    rd.Longitude,
+		TemperatureC: rd.TemperatureC,
+		WindspeedKph: rd.WindspeedKph,
+		ObservedAt:   rd.ObservedAt,
+		Source:       rd.Source,
+	})
+	if err != nil {
+		log.Printf("api: immediate reading store for %s: %v", c.Name, err)
+		return
+	}
+
+	tempGauge.WithLabelValues(rd.City).Set(rd.TemperatureC)
+	windGauge.WithLabelValues(rd.City).Set(rd.WindspeedKph)
+	publishedTotal.Inc()
+}
+
+WEOF
+
+cat > "$ROOT/app/ui_page.go" <<'WEOF'
+package main
+
+// weatherUIHTML is the entire frontend: one static page (HTML + CSS + JS),
+// no build step, no framework. It only talks back to this server through
+// the plain JSON endpoints in http_handlers.go (GET/POST /cities, GET
+// /readings/latest) - kept in its own file so the Go logic files above
+// don't have hundreds of lines of markup interrupting them.
 const weatherUIHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1215,79 +1681,6 @@ loadCities();
 </body>
 </html>`
 
-func publishAll(amqpURL, queue string, cities []cityCoord) {
-	conn, err := amqp.Dial(amqpURL)
-	if err != nil {
-		log.Printf("api: amqp dial: %v", err)
-		return
-	}
-	defer conn.Close()
-	ch, err := conn.Channel()
-	if err != nil {
-		log.Printf("api: channel: %v", err)
-		return
-	}
-	defer ch.Close()
-	if _, err := ch.QueueDeclare(queue, true, false, false, false, nil); err != nil {
-		log.Printf("api: queue declare: %v", err)
-		return
-	}
-	for _, c := range cities {
-		rd, err := fetchOne(c)
-		if err != nil {
-			log.Printf("api: fetch %s: %v", c.Name, err)
-			continue
-		}
-		body, _ := json.Marshal(rd)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err = ch.PublishWithContext(ctx, "", queue, false, false, amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body,
-		})
-		cancel()
-		if err != nil {
-			log.Printf("api: publish %s: %v", c.Name, err)
-			continue
-		}
-		tempGauge.WithLabelValues(rd.City).Set(rd.TemperatureC)
-		windGauge.WithLabelValues(rd.City).Set(rd.WindspeedKph)
-		publishedTotal.Inc()
-		log.Printf("api: published %s temp=%.1f", rd.City, rd.TemperatureC)
-	}
-}
-
-func fetchOne(c cityCoord) (reading, error) {
-	url := fmt.Sprintf(
-		"https://api.open-meteo.com/v1/forecast?latitude=%f&longitude=%f&current_weather=true",
-		c.Lat, c.Lon)
-	client := http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return reading{}, err
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	var parsed struct {
-		CurrentWeather struct {
-			Temperature float64 `json:"temperature"`
-			Windspeed   float64 `json:"windspeed"`
-			Time        string  `json:"time"`
-		} `json:"current_weather"`
-	}
-	if err := json.Unmarshal(b, &parsed); err != nil {
-		return reading{}, err
-	}
-	return reading{
-		City:         c.Name,
-		Latitude:     c.Lat,
-		Longitude:    c.Lon,
-		TemperatureC: parsed.CurrentWeather.Temperature,
-		WindspeedKph: parsed.CurrentWeather.Windspeed,
-		ObservedAt:   parsed.CurrentWeather.Time,
-		Source:       "open-meteo",
-	}, nil
-}
-
 WEOF
 
 # ============================== app/consumer.go =============================
@@ -1307,6 +1700,14 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+// runConsumer is the entire life of the `consumer` mode: connect to store
+// (gRPC) and RabbitMQ, then sit in a loop forever, taking each message off
+// the queue and asking store to persist it. This is the only thing api's
+// fetch loop is decoupled from - if store or RabbitMQ is briefly down, api
+// keeps fetching from Open-Meteo and queuing messages; consumer just picks
+// up the backlog once things recover, nothing gets silently dropped by api
+// itself. (Whether the queue itself can lose messages is a different,
+// separate question - see the auto-ack note near the bottom of this file.)
 func runConsumer() {
 	amqpURL := "amqp://" + getenv("RABBITMQ_DEFAULT_USER", "admin") + ":" +
 		getenv("RABBITMQ_DEFAULT_PASS", "") + "@" +
@@ -1314,6 +1715,10 @@ func runConsumer() {
 	queue := getenv("QUEUE", "weather.readings")
 	storeAddr := getenv("STORE_ADDR", "weather-store:9090")
 
+	// gRPC connections don't actually dial immediately - grpc.NewClient
+	// just prepares the client, the real connection attempt happens lazily
+	// on the first call. So this can't fail just because store isn't up
+	// yet; that would only surface later, on the first AddReading call.
 	conn, err := grpc.NewClient(storeAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("consumer: cannot create store client: %v", err)
@@ -1321,6 +1726,11 @@ func runConsumer() {
 	defer conn.Close()
 	client := pb.NewWeatherStoreClient(conn)
 
+	// RabbitMQ, unlike gRPC above, connects eagerly - amqp.Dial actually
+	// opens a TCP connection right away, so it genuinely can fail if
+	// RabbitMQ isn't ready yet. Retry with the same pattern used
+	// throughout this project (30 attempts, 2s apart) rather than crash
+	// and rely on Docker to restart us into the same race condition.
 	var mq *amqp.Connection
 	for i := 0; i < 30; i++ {
 		mq, err = amqp.Dial(amqpURL)
@@ -1340,13 +1750,28 @@ func runConsumer() {
 		log.Fatalf("consumer: channel: %v", err)
 	}
 	defer ch.Close()
+
+	// Declaring the queue here too (api also declares it before publishing)
+	// is intentional, not redundant - RabbitMQ's queue declaration is
+	// idempotent, and this way consumer works correctly even if it happens
+	// to start up before api ever has.
 	if _, err := ch.QueueDeclare(queue, true, false, false, false, nil); err != nil {
 		log.Fatalf("consumer: queue declare: %v", err)
 	}
+
+	// auto-ack=true (the third `true` below) means RabbitMQ considers a
+	// message delivered - and removes it from the queue - the moment it's
+	// handed to this process, before we've actually stored it anywhere.
+	// If this process crashes between receiving a message and finishing
+	// the AddReading call below, that one reading is lost. Fine for a
+	// weather app polling every few minutes; would be worth switching to
+	// manual ack (only acknowledging after AddReading succeeds) for
+	// anything where losing a message actually matters.
 	msgs, err := ch.Consume(queue, "", true, false, false, false, nil)
 	if err != nil {
 		log.Fatalf("consumer: consume: %v", err)
 	}
+
 	log.Println("consumer: waiting for messages")
 	for d := range msgs {
 		var r reading
@@ -1354,6 +1779,7 @@ func runConsumer() {
 			log.Printf("consumer: bad message: %v", err)
 			continue
 		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		resp, err := client.AddReading(ctx, &pb.Reading{
 			City:         r.City,
@@ -1372,6 +1798,7 @@ func runConsumer() {
 		log.Printf("consumer: stored id=%d city=%s", resp.Id, r.City)
 	}
 }
+
 WEOF
 
 # ============================== app/Dockerfile ==============================
